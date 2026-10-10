@@ -1,5 +1,6 @@
 import io
 import hmac
+import os
 import datetime as dt
 import pandas as pd
 import streamlit as st
@@ -14,6 +15,24 @@ html, body, [data-testid="stAppViewContainer"], .stMarkdown, label, .stTabs {dir
 </style>""", unsafe_allow_html=True)
 
 STATUSES = ["פעיל", "הושלם", "בהשהייה"]
+BRAND = "#222B52"   # כחול כהה מהלוגו
+ACCENT = "#2AA4AB"  # טורקיז מהלוגו
+st.markdown(f"""<style>
+button[kind="primary"] {{background: {BRAND}; border-color: {BRAND};}}
+button[data-baseweb="tab"][aria-selected="true"] {{color: {ACCENT};}}
+[data-baseweb="tab-highlight"] {{background-color: {ACCENT};}}
+[data-testid="stMetric"] {{background: rgba(42,164,171,.12); border-radius: 12px; padding: .8rem 1rem;}}
+h1, h2, h3 {{color: {BRAND};}}
+.stTabs [data-baseweb="tab"] {{font-size: 1.05rem; padding: .6rem 1rem;}}
+[data-testid="stForm"] {{border-radius: 16px; border: 1px solid rgba(42,164,171,.35); background: rgba(42,164,171,.05); padding: 1rem;}}
+.stButton>button, .stDownloadButton>button {{border-radius: 12px;}}
+</style>""", unsafe_allow_html=True)
+
+
+def header_logo(w=150):
+    if os.path.exists("logo.png"):
+        st.image("logo.png", width=w)
+
 
 
 @st.cache_resource
@@ -38,6 +57,7 @@ def to_excel(df, sheet="דוח"):
 def login():
     if st.session_state.get("user"):
         return True
+    header_logo(280)
     st.title("📐 כניסה למערכת")
     users = st.secrets["users"]
     uname = st.text_input("שם משתמש").strip().lower()
@@ -73,12 +93,15 @@ except Exception as ex:
 USER = st.session_state.user
 IS_ADMIN = USER["role"] == "admin"
 
-emps = load("employees")
+emps = load("employees") if IS_ADMIN else load("employees", "id,name")
 me = emps.loc[emps["name"] == USER["employee"], "id"]
 MY_ID = int(me.iloc[0]) if not me.empty else None
 if IS_ADMIN:
     projs = load("projects")
     entries = load("time_entries")
+    pays = load("payments")
+    if pays.empty:
+        pays = pd.DataFrame(columns=["id", "project_id", "pay_date", "amount", "note"])
 else:  # עובדת: בלי עמודת סכום, ורק הרישומים שלה
     projs = load("projects", "id,client,name,status")
     entries = load("time_entries", employee_id=MY_ID) if MY_ID else pd.DataFrame()
@@ -90,23 +113,58 @@ if entries.empty:
 
 projs["label"] = projs["client"].astype(str) + " – " + projs["name"].astype(str)
 
+header_logo(230)
 top = st.columns([4, 1])
 top[0].title("📐 ניהול שעות ורווחיות")
 if top[1].button("🔄 רענון"):
     st.rerun()
-st.caption(f"מחובר/ת: {USER['employee']}")
+if IS_ADMIN:
+    st.caption(f"מחובר/ת: {USER['employee']}")
+else:
+    st.markdown(f"#### שלום {USER['employee']} 👋")
+    st.caption("כאן רושמים שעות עבודה ורואים את הסיכום החודשי. שיהיה יום מצוין!")
 if st.button("🚪 יציאה"):
     st.session_state.clear()
     st.rerun()
 
 if IS_ADMIN:
-    t_log, t_proj, t_dash, t_rep = st.tabs(["⏱ רישום שעות", "📁 פרויקטים", "📊 דשבורד", "🗓 דוחות חודשיים"])
+    t_log, t_proj, t_pay, t_dash, t_rep, t_set = st.tabs(["⏱ רישום שעות", "📁 פרויקטים", "💰 תשלומים", "📊 דשבורד", "🗓 דוחות חודשיים", "⚙ הגדרות"])
 else:
     t_log, t_rep = st.tabs(["⏱ רישום שעות", "🗓 הסיכום החודשי שלי"])
 
 # ---------------- רישום שעות ----------------
 with t_log:
     active = projs[projs["status"] == "פעיל"]
+    if MY_ID and not active.empty:
+        tr = db().table("timers").select("*").eq("employee_id", MY_ID).execute().data
+        with st.container(border=True):
+            if tr:
+                t0 = pd.to_datetime(tr[0]["started_at"], utc=True)
+                secs = (pd.Timestamp.now(tz="UTC") - t0).total_seconds()
+                pl = projs.loc[projs["id"] == tr[0]["project_id"], "label"]
+                st.markdown(f"### ⏱ טיימר פועל: {pl.iloc[0] if not pl.empty else ''}")
+                st.write(f"התחיל ב-{t0.tz_convert('Asia/Jerusalem').strftime('%H:%M')} · חלפו {int(secs // 3600)}:{int(secs % 3600 // 60):02d} שעות")
+                tdesc = st.text_input("מה בוצע? (חובה)", key="tdesc")
+                b1, b2 = st.columns(2)
+                if b1.button("⏹ עצירה ושמירה", type="primary"):
+                    if not tdesc.strip():
+                        st.error("יש לכתוב מה בוצע.")
+                    else:
+                        db().table("time_entries").insert({
+                            "employee_id": MY_ID, "project_id": int(tr[0]["project_id"]),
+                            "work_date": str(t0.tz_convert("Asia/Jerusalem").date()),
+                            "hours": min(max(round(secs / 3600, 2), 0.01), 24), "description": tdesc.strip()}).execute()
+                        db().table("timers").delete().eq("employee_id", MY_ID).execute()
+                        st.rerun()
+                if b2.button("✖ ביטול"):
+                    db().table("timers").delete().eq("employee_id", MY_ID).execute()
+                    st.rerun()
+            else:
+                st.markdown("### ▶ טיימר")
+                tp = st.selectbox("פרויקט", active["label"], key="tp")
+                if st.button("▶ התחל עבודה", type="primary"):
+                    db().table("timers").upsert({"employee_id": MY_ID, "project_id": int(active.loc[active["label"] == tp, "id"].iloc[0])}).execute()
+                    st.rerun()
     if active.empty or emps.empty:
         st.info("יש להגדיר לפחות עובד/ת אחד/ת ופרויקט פעיל אחד.")
     else:
@@ -187,6 +245,11 @@ if IS_ADMIN:
             h = entries.groupby("project_id")["hours"].sum().rename("hours")
             d = projs.merge(h, left_on="id", right_index=True, how="left").fillna({"hours": 0})
             d["hourly"] = d.apply(lambda r: r["budget"] / r["hours"] if r["hours"] > 0 else None, axis=1)
+            ec = entries.merge(emps[["id", "hourly_cost"]].rename(columns={"id": "employee_id"}), on="employee_id", how="left")
+            ec["cost"] = ec["hours"].astype(float) * ec["hourly_cost"].astype(float).fillna(0)
+            d = d.merge(ec.groupby("project_id")["cost"].sum(), left_on="id", right_index=True, how="left").fillna({"cost": 0})
+            d["profit"] = d["budget"].astype(float) - d["cost"]
+            d["profit_h"] = d.apply(lambda r: r["profit"] / r["hours"] if r["hours"] > 0 else None, axis=1)
             flt = st.multiselect("סינון לפי סטטוס", STATUSES, default=["פעיל"])
             d = d[d["status"].isin(flt)]
             m1, m2, m3 = st.columns(3)
@@ -194,13 +257,16 @@ if IS_ADMIN:
             m2.metric("סה\"כ תקציבים", f"₪{d['budget'].sum():,.0f}")
             tot = d["hours"].sum()
             m3.metric("תמורה ממוצעת לשעה", f"₪{d['budget'].sum() / tot:,.0f}" if tot else "—")
-            out = d[["label", "status", "budget", "hours", "hourly"]].rename(columns={
+            out = d[["label", "status", "budget", "hours", "hourly", "cost", "profit", "profit_h"]].rename(columns={
                 "label": "פרויקט", "status": "סטטוס", "budget": "סכום פרויקט (₪)",
-                "hours": "סה\"כ שעות", "hourly": "תמורה לשעה (₪)"})
+                "hours": "סה\"כ שעות", "hourly": "תמורה לשעה (₪)", "cost": "עלות שכר (₪)", "profit": "רווח (₪)", "profit_h": "רווח לשעה (₪)"})
             st.dataframe(out, hide_index=True, use_container_width=True, column_config={
                 "סכום פרויקט (₪)": st.column_config.NumberColumn(format="%,.0f"),
                 "סה\"כ שעות": st.column_config.NumberColumn(format="%.1f"),
-                "תמורה לשעה (₪)": st.column_config.NumberColumn(format="%,.0f")})
+                "תמורה לשעה (₪)": st.column_config.NumberColumn(format="%,.0f"),
+            "עלות שכר (₪)": st.column_config.NumberColumn(format="%,.0f"),
+            "רווח (₪)": st.column_config.NumberColumn(format="%,.0f"),
+            "רווח לשעה (₪)": st.column_config.NumberColumn(format="%,.0f")})
             st.download_button("⬇ ייצוא ל-Excel", to_excel(out, "רווחיות"), "profitability.xlsx")
             st.subheader("שעות לפי עובדת בכל פרויקט")
             pe = (entries[entries["project_id"].isin(d["id"])]
@@ -212,6 +278,55 @@ if IS_ADMIN:
                 piv = pe.pivot_table(index="פרויקט", columns="עובד/ת", values="hours", aggfunc="sum", fill_value=0, margins=True, margins_name="סה\"כ").reset_index()
                 st.dataframe(piv, hide_index=True, use_container_width=True)
                 st.download_button("⬇ ייצוא שעות לפי עובדת", to_excel(piv, "שעות"), "hours_by_employee.xlsx")
+
+if IS_ADMIN:
+    with t_pay:
+        if projs.empty:
+            st.info("אין פרויקטים עדיין.")
+        else:
+            with st.form("pay", clear_on_submit=True):
+                pp = st.selectbox("פרויקט", projs["label"])
+                c1, c2 = st.columns(2)
+                amt = c1.number_input("סכום ששולם (₪)", 0.0, step=500.0)
+                pdate = c2.date_input("תאריך קבלה", dt.date.today())
+                note = st.text_input("הערה (למשל: מקדמה / שלב א')")
+                if st.form_submit_button("➕ רישום תשלום", type="primary"):
+                    if amt > 0:
+                        db().table("payments").insert({"project_id": int(projs.loc[projs["label"] == pp, "id"].iloc[0]),
+                                                       "pay_date": str(pdate), "amount": amt, "note": note}).execute()
+                        st.rerun()
+                    else:
+                        st.error("יש להזין סכום גדול מ-0.")
+            paid = pays.groupby("project_id")["amount"].sum().astype(float).rename("paid") if not pays.empty else pd.Series(dtype=float, name="paid")
+            g = projs.merge(paid, left_on="id", right_index=True, how="left").fillna({"paid": 0})
+            g["left"] = g["budget"].astype(float) - g["paid"]
+            m1, m2 = st.columns(2)
+            m1.metric("סה\"כ התקבל", f"₪{g['paid'].sum():,.0f}")
+            m2.metric("סה\"כ עוד לגבות", f"₪{g['left'].sum():,.0f}")
+            st.subheader("מצב גבייה לפי פרויקט")
+            st.dataframe(g[["label", "status", "budget", "paid", "left"]].rename(columns={
+                "label": "פרויקט", "status": "סטטוס", "budget": "סכום (₪)", "paid": "שולם (₪)", "left": "נותר לגבות (₪)"}),
+                hide_index=True, use_container_width=True)
+            if not pays.empty:
+                with st.expander("היסטוריית תשלומים"):
+                    hp = pays.merge(projs[["id", "label"]].rename(columns={"id": "project_id"}), on="project_id")
+                    st.dataframe(hp[["id", "pay_date", "label", "amount", "note"]].sort_values("pay_date", ascending=False),
+                                 hide_index=True, use_container_width=True)
+                    did = st.selectbox("מס' תשלום למחיקה", hp["id"])
+                    if st.button("מחק תשלום"):
+                        db().table("payments").delete().eq("id", int(did)).execute()
+                        st.rerun()
+
+    with t_set:
+        st.subheader("עלות שכר לשעה")
+        st.caption("נראה רק לך. משמש לחישוב רווח אמיתי בדשבורד (סכום הפרויקט פחות עלות השעות).")
+        vals = {}
+        for _, r in emps.iterrows():
+            vals[int(r["id"])] = st.number_input(f"עלות לשעה – {r['name']} (₪)", 0.0, value=float(r.get("hourly_cost") or 0), step=5.0, key=f"hc{r['id']}")
+        if st.button("💾 שמירה", type="primary"):
+            for i, v in vals.items():
+                db().table("employees").update({"hourly_cost": v}).eq("id", i).execute()
+            st.success("נשמר ✅")
 
 # ---------------- דוחות חודשיים ----------------
 with t_rep:
