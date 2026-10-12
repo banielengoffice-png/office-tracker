@@ -579,7 +579,7 @@ if IS_ADMIN:
                 ep = st.selectbox("פרויקט", projs["label"], key="ep")
                 c1, c2 = st.columns(2)
                 ea = c1.number_input("סכום (₪)", 0.0, step=50.0)
-                ed2 = c2.date_input("תאריך", TODAY, key="ed2")
+                ed2 = c2.date_input("תאריך", TODAY, key="exp_date_in")
                 en = st.text_input("תיאור (יועץ, הדפסות, אגרה...)")
                 if st.form_submit_button("➕ הוספת הוצאה", type="primary"):
                     if ea > 0:
