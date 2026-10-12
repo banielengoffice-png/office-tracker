@@ -740,6 +740,54 @@ if IS_ADMIN:
         return pd.DataFrame(rows_)
 
     PCT = {"% שולם": st.column_config.ProgressColumn(format="%.0f%%", min_value=0, max_value=100)}
+    def fin_editor(pid, kk):
+        st.markdown("**💳 תשלומים שהתקבלו**")
+        pp_ = pays[pays["project_id"] == pid]
+        if pp_.empty:
+            st.caption("לא נרשמו תשלומים.")
+        else:
+            st.dataframe(pp_[["id", "pay_date", "amount", "note"]].rename(columns={"id": "מס'", "pay_date": "תאריך", "amount": "סכום (₪)", "note": "הערה"}), hide_index=True, use_container_width=True)
+            x1, x2 = st.columns([3, 1])
+            dp_ = x1.selectbox("מס' תשלום למחיקה", pp_["id"], key=f"fe_dp_{kk}")
+            if x2.button("מחק", key=f"fe_dpb_{kk}"):
+                db().table("payments").delete().eq("id", int(dp_)).execute()
+                st.rerun()
+        with st.form(f"fe_fp_{kk}", clear_on_submit=True):
+            x1, x2 = st.columns(2)
+            a_ = x1.number_input("סכום ששולם (₪)", 0.0, step=500.0, key=f"fe_pa_{kk}")
+            d_ = x2.date_input("תאריך קבלה", TODAY, key=f"fe_pd_{kk}")
+            n_ = st.text_input("הערה (מקדמה / שלב...)", key=f"fe_pn_{kk}")
+            if st.form_submit_button("➕ רישום תשלום", type="primary"):
+                if a_ > 0:
+                    db().table("payments").insert({"project_id": pid, "pay_date": str(d_), "amount": a_, "note": n_}).execute()
+                    st.rerun()
+                else:
+                    st.error("יש להזין סכום גדול מ-0.")
+        st.markdown("**🚩 אבני דרך**")
+        ms_ = mstones[mstones["project_id"] == pid]
+        if ms_.empty:
+            st.caption("לא הוגדרו אבני דרך.")
+        else:
+            st.dataframe(ms_[["id", "name", "due_date", "amount", "done"]].rename(columns={"id": "מס'", "name": "אבן דרך", "due_date": "תאריך יעד", "amount": "סכום (₪)", "done": "בוצע/שולם"}), hide_index=True, use_container_width=True)
+            mi_ = st.selectbox("מס' אבן דרך", ms_["id"], key=f"fe_mi_{kk}")
+            y1, y2, y3 = st.columns(3)
+            if y1.button("סמן כבוצע", key=f"fe_md_{kk}"):
+                db().table("milestones").update({"done": True}).eq("id", int(mi_)).execute()
+                st.rerun()
+            if y2.button("בטל סימון", key=f"fe_mu_{kk}"):
+                db().table("milestones").update({"done": False}).eq("id", int(mi_)).execute()
+                st.rerun()
+            if y3.button("מחק", key=f"fe_ml_{kk}"):
+                db().table("milestones").delete().eq("id", int(mi_)).execute()
+                st.rerun()
+        with st.form(f"fe_fm_{kk}", clear_on_submit=True):
+            z1, z2, z3 = st.columns(3)
+            mn_ = z1.text_input("שם אבן דרך", key=f"fe_mn_{kk}")
+            md_ = z2.date_input("תאריך יעד", TODAY, key=f"fe_mdt_{kk}")
+            ma_ = z3.number_input("סכום (₪)", 0.0, step=500.0, key=f"fe_ma_{kk}")
+            if st.form_submit_button("➕ הוספת אבן דרך") and mn_.strip():
+                db().table("milestones").insert({"project_id": pid, "name": mn_.strip(), "due_date": str(md_), "amount": ma_}).execute()
+                st.rerun()
 
     # ---- פרויקטים שהושלמו ----
     with t_done:
@@ -762,10 +810,7 @@ if IS_ADMIN:
                     if s_["left"] > 0:
                         st.warning(f"נותר לגבות ₪{s_['left']:,.0f}")
                     st.write(f"שעות שהושקעו: {s_['hours']:.1f} · הוצאות: ₪{s_['exp']:,.0f}")
-                    if s_["ms"].empty:
-                        st.caption("לא הוגדרו אבני דרך לפרויקט.")
-                    else:
-                        st.dataframe(ms_tbl(s_["ms"]), hide_index=True, use_container_width=True)
+                    fin_editor(int(p["id"]), f"d{p['id']}")
                     if st.button("↩ החזר לעבודה", key=f"reo{p['id']}"):
                         db().table("projects").update({"status": "פעיל", "completed_at": None}).eq("id", int(p["id"])).execute()
                         st.rerun()
@@ -798,8 +843,7 @@ if IS_ADMIN:
                     dt_ = tasks[(tasks["project_id"] == pid_) & tasks["done"].astype(bool)]
                     if not dt_.empty:
                         st.write("משימות שבוצעו: " + " · ".join(dt_["title"]))
-                    if not s_["ms"].empty:
-                        st.dataframe(ms_tbl(s_["ms"]), hide_index=True, use_container_width=True)
+                    fin_editor(pid_, f"z{pid_}")
                     if st.button("🔓 שחרר הקפאה – החזר לעבודה", key=f"unf{pid_}", type="primary"):
                         db().table("projects").update({"status": "פעיל", "freeze_reason": None, "frozen_at": None}).eq("id", pid_).execute()
                         st.rerun()
@@ -860,6 +904,27 @@ if IS_ADMIN:
                         if st.button("מחק", key=f"fdb{cat}"):
                             db().table("followups").delete().eq("id", int(fdel)).execute()
                             st.rerun()
+
+if IS_ADMIN:
+    with t_proj:
+        st.divider()
+        st.subheader("🗑 מחיקת פרויקט")
+        if projs.empty:
+            st.caption("אין פרויקטים.")
+        else:
+            dsel = st.selectbox("בחירת פרויקט למחיקה", projs["label"], key="delsel")
+            did_ = int(projs.loc[projs["label"] == dsel, "id"].iloc[0])
+            cnt = {"רישומי שעות": int((entries["project_id"] == did_).sum()), "תשלומים": int((pays["project_id"] == did_).sum()),
+                   "אבני דרך": int((mstones["project_id"] == did_).sum()), "הוצאות": int((exps["project_id"] == did_).sum()),
+                   "משימות": int((tasks["project_id"] == did_).sum())}
+            st.warning("המחיקה סופית, ותמחק גם את כל הנתונים של הפרויקט: " + ", ".join(f"{v} {k}" for k, v in cnt.items()) + ". מומלץ להוריד גיבוי קודם (הגדרות ← גיבוי).")
+            conf = st.text_input('לאישור, להקליד את המילה: מחק', key=f"delc{did_}")
+            if st.button("🗑 מחיקת הפרויקט לצמיתות", key="delbtn"):
+                if conf.strip() == "מחק":
+                    db().table("projects").delete().eq("id", did_).execute()
+                    st.rerun()
+                else:
+                    st.error("כדי למחוק יש להקליד את המילה: מחק")
 
 # ---------------- דוחות חודשיים ----------------
 with t_rep:
