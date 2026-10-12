@@ -1,4 +1,7 @@
 import io
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import hmac
 import os
 import datetime as dt
@@ -52,11 +55,53 @@ def db():
     return create_client(st.secrets["SUPABASE_URL"].strip().rstrip("/"), st.secrets["SUPABASE_KEY"].strip())
 
 
-def load(table, cols="*", **eq):
-    q = db().table(table).select(cols)
-    for k, v in eq.items():
-        q = q.eq(k, v)
+@st.cache_resource
+def store():
+    return {"d": {}, "lock": threading.Lock()}
+
+
+def _key(t, c, e):
+    return (t, c, tuple(sorted((k, tuple(v) if isinstance(v, list) else v) for k, v in e.items())))
+
+
+def _fetch(client, t, c, e):
+    q = client.table(t).select(c)
+    for k, v in e.items():
+        q = q.in_(k, v) if isinstance(v, (list, tuple)) else q.eq(k, v)
     return pd.DataFrame(q.execute().data)
+
+
+def _get(k):
+    with store()["lock"]:
+        h = store()["d"].get(k)
+    return h[1] if h and time.time() - h[0] < 600 else None
+
+
+def load(table, cols="*", **eq):
+    k = _key(table, cols, eq)
+    df = _get(k)
+    if df is None:
+        df = _fetch(db(), table, cols, eq)
+        with store()["lock"]:
+            store()["d"][k] = (time.time(), df)
+    return df.copy()
+
+
+def prefetch(specs):  # שליפה מקבילית של כל הטבלאות
+    client = db()
+    todo = [sp for sp in specs if _get(_key(*sp)) is None]
+    if todo:
+        with ThreadPoolExecutor(8) as ex:
+            res = list(ex.map(lambda sp: _fetch(client, *sp), todo))
+        with store()["lock"]:
+            for sp, df in zip(todo, res):
+                store()["d"][_key(*sp)] = (time.time(), df)
+
+
+def rerun():  # אחרי כל שינוי: מנקים זיכרון כדי שכולם יראו נתונים עדכניים
+    with store()["lock"]:
+        store()["d"].clear()
+    st.rerun()
 
 
 def to_excel(df, sheet="דוח"):
@@ -80,7 +125,7 @@ def login():
         ok = hmac.compare_digest((str(u["password"]) if u else "x").encode(), pw.encode()) and u is not None
         if ok:
             st.session_state.user = {"role": u["role"], "employee": u["employee"]}
-            st.rerun()
+            rerun()
         st.error("שם משתמש או סיסמה שגויים")
     return False
 
@@ -92,7 +137,9 @@ st_autorefresh(interval=30_000, key="auto")  # סנכרון: רענון אוטו
 
 # בדיקת חיבור עם הודעה ברורה (בלי לחשוף את המפתח)
 try:
-    db().table("employees").select("id").limit(1).execute()
+    if not st.session_state.get("db_ok"):
+        db().table("employees").select("id").limit(1).execute()
+        st.session_state.db_ok = True
 except Exception as ex:
     k = st.secrets["SUPABASE_KEY"].strip()
     st.error("⚠️ החיבור למסד הנתונים נכשל")
@@ -108,6 +155,16 @@ IS_ADMIN = USER["role"] == "admin"
 emps = load("employees") if IS_ADMIN else load("employees", "id,name")
 me = emps.loc[emps["name"] == USER["employee"], "id"]
 MY_ID = int(me.iloc[0]) if not me.empty else None
+if IS_ADMIN:
+    SP = [(t, "*", {}) for t in ["projects", "time_entries", "payments", "tasks", "month_locks", "expenses", "milestones", "leads", "project_access", "followups", "followup_notes", "attendance"]]
+else:
+    SP = [("projects", "id,client,name,status", {}), ("tasks", "*", {}), ("month_locks", "*", {})]
+    if MY_ID:
+        SP += [("time_entries", "*", {"employee_id": MY_ID}), ("project_access", "*", {"employee_id": MY_ID}), ("attendance", "*", {"employee_id": MY_ID}),
+               ("followups", "id,category,title,contact,notes,due_date,done,employee_id", {"employee_id": MY_ID})]
+if MY_ID:
+    SP.append(("timers", "*", {"employee_id": MY_ID}))
+prefetch(SP)
 if IS_ADMIN:
     projs = load("projects")
     entries = load("time_entries")
@@ -148,6 +205,7 @@ if IS_ADMIN:
     exps = lc("expenses", ["id", "project_id", "exp_date", "amount", "note"])
     access = lc("project_access", ["project_id", "employee_id"])
     fus = lc("followups", ["id", "category", "title", "contact", "notes", "amount", "due_date", "done", "employee_id"])
+    fnotes = lc("followup_notes", ["id", "followup_id", "author_id", "text", "created_at"])
     mstones = lc("milestones", ["id", "project_id", "name", "due_date", "amount", "done"])
     leads = lc("leads", ["id", "client", "descr", "amount", "status"])
 TODAY = dt.date.today()
@@ -170,7 +228,7 @@ header_logo(230)
 top = st.columns([4, 1])
 top[0].title("📐 ניהול שעות ורווחיות")
 if top[1].button("🔄 רענון"):
-    st.rerun()
+    rerun()
 if IS_ADMIN:
     st.caption(f"מחובר/ת: {USER['employee']}")
 else:
@@ -178,7 +236,7 @@ else:
     st.caption("כאן רושמים שעות עבודה ורואים את הסיכום החודשי. שיהיה יום מצוין!")
 if st.button("🚪 יציאה"):
     st.session_state.clear()
-    st.rerun()
+    rerun()
 
 is_mine = lambda df: df["employee_id"].isna() | (df["employee_id"] == MY_ID)
 ts_today = pd.Timestamp(TODAY)
@@ -198,6 +256,38 @@ if due_msgs:
         if k not in seen:
             st.toast(m, icon="🔔")
             seen.add(k)
+if not IS_ADMIN:
+    fnotes = load("followup_notes", followup_id=[int(x) for x in fus["id"]]) if not fus.empty else pd.DataFrame()
+    if fnotes.empty:
+        fnotes = pd.DataFrame(columns=["id", "followup_id", "author_id", "text", "created_at"])
+
+
+def fu_notes_list(r):
+    out = [(None, None, r["notes"])] if nz(r.get("notes"), "") else []
+    for n in fnotes[fnotes["followup_id"] == int(r["id"])].sort_values("created_at").itertuples():
+        out.append((n.author_id, n.created_at, n.text))
+    return out
+
+
+def fu_notes(r, kk):
+    lst = fu_notes_list(r)
+    if lst:
+        st.info(f"📝 {lst[-1][2]}")
+    with st.expander(f"📝 הערות ({len(lst)}) / הוספת הערה"):
+        for a_, t_, tx_ in lst:
+            wn_ = emps.loc[emps["id"] == a_, "name"]
+            when_ = pd.to_datetime(t_, utc=True).tz_convert("Asia/Jerusalem").strftime("%d/%m %H:%M") if t_ is not None else "ראשונית"
+            st.markdown(f"**{wn_.iloc[0] if not wn_.empty else ''} · {when_}:** {tx_}")
+        with st.form(f"fn_{kk}", clear_on_submit=True):
+            nt_ = st.text_input("הערה חדשה", key=f"fnt_{kk}")
+            if st.form_submit_button("➕ הוספת הערה") and nt_.strip():
+                db().table("followup_notes").insert({"followup_id": int(r["id"]), "author_id": MY_ID, "text": nt_.strip()}).execute()
+                rerun()
+
+
+n_noted = sum(1 for _, r_ in fus[~fus["done"].astype(bool)].iterrows() if fu_notes_list(r_)) if not fus.empty else 0
+if n_noted:
+    st.warning(f"📝 {n_noted} פולואפים פתוחים עם הערות – ראה בלשונית " + ("פולואפ ושיווק" if IS_ADMIN else "משימות"))
 late = open_t[open_t["ws"] < CUR_WS]
 if not late.empty:
     st.error("⏰ משימות שלא טופלו בשבוע שעבר – דבר ראשון לטפל בהן:\n\n" +
@@ -229,18 +319,18 @@ with t_log:
                 st.write(f"התחלת ב-{jt(openr.iloc[0]['started_at']).strftime('%H:%M')} · סה\"כ היום: {done_today:.2f} שעות · נרשמו לפרויקטים: {logged:.2f}")
                 if st.button("🏁 סיום יום עבודה", type="primary"):
                     db().table("attendance").update({"ended_at": pd.Timestamp.now(tz="UTC").isoformat()}).eq("id", int(openr.iloc[0]["id"])).execute()
-                    st.rerun()
+                    rerun()
             else:
                 st.markdown("### 🕘 שעון נוכחות")
                 if done_today > 0:
                     st.write(f"היום עבדת {done_today:.2f} שעות · נרשמו לפרויקטים: {logged:.2f}")
                 if st.button("▶ התחלת יום עבודה", type="primary"):
                     db().table("attendance").insert({"employee_id": MY_ID}).execute()
-                    st.rerun()
+                    rerun()
             if done_today > 0 and done_today - logged > 0.25:
                 st.info(f"נותרו כ-{done_today - logged:.1f} שעות מהיום שעדיין לא שויכו לפרויקט")
     if MY_ID and not active.empty:
-        tr = db().table("timers").select("*").eq("employee_id", MY_ID).execute().data
+        tr = load("timers", employee_id=MY_ID).to_dict("records")
         with st.container(border=True):
             if tr:
                 t0 = pd.to_datetime(tr[0]["started_at"], utc=True)
@@ -262,16 +352,16 @@ with t_log:
                             "work_date": str(t0.tz_convert("Asia/Jerusalem").date()),
                             "hours": min(max(round(secs / 3600, 2), 0.01), 24), "description": tdesc.strip(), "work_type": twt}).execute()
                         db().table("timers").delete().eq("employee_id", MY_ID).execute()
-                        st.rerun()
+                        rerun()
                 if b2.button("✖ ביטול"):
                     db().table("timers").delete().eq("employee_id", MY_ID).execute()
-                    st.rerun()
+                    rerun()
             else:
                 st.markdown("### ▶ טיימר")
                 tp = st.selectbox("פרויקט", active["label"], key="tp")
                 if st.button("▶ התחל עבודה", type="primary"):
                     db().table("timers").upsert({"employee_id": MY_ID, "project_id": int(active.loc[active["label"] == tp, "id"].iloc[0])}).execute()
-                    st.rerun()
+                    rerun()
     if active.empty or emps.empty:
         st.info("יש להגדיר לפחות עובד/ת אחד/ת ופרויקט פעיל אחד.")
     else:
@@ -302,7 +392,7 @@ with t_log:
                         "work_date": str(day), "hours": float(hrs), "description": desc.strip(), "work_type": wtype,
                     }).execute()
                     st.success("נשמר ✅")
-                    st.rerun()
+                    rerun()
 
     st.subheader("רישומים אחרונים")
     if not entries.empty:
@@ -325,7 +415,7 @@ with t_log:
                     st.error("יש להזין שעות ותיאור.")
                 else:
                     db().table("time_entries").update({"hours": eh, "description": ed.strip(), "work_type": ew}).eq("id", int(eid)).execute()
-                    st.rerun()
+                    rerun()
         with st.expander("🗑 מחיקת רישום"):
             did = st.selectbox("מספר רישום למחיקה", v["id"])
             if st.button("מחק"):
@@ -333,7 +423,7 @@ with t_log:
                     st.error("החודש ננעל לעריכה.")
                 else:
                     db().table("time_entries").delete().eq("id", int(did)).execute()
-                    st.rerun()
+                    rerun()
 
 if IS_ADMIN:
     # ---------------- פרויקטים ----------------
@@ -358,7 +448,7 @@ if IS_ADMIN:
                                                    "est_hours": est, "ptype": ptype, "drive_url": drive.strip()}).execute()
                     if acc_new:
                         db().table("project_access").insert([{"project_id": new_p.data[0]["id"], "employee_id": int(emps.loc[emps["name"] == n, "id"].iloc[0])} for n in acc_new]).execute()
-                    st.rerun()
+                    rerun()
                 else:
                     st.error("יש למלא שם לקוח ושם פרויקט.")
 
@@ -374,13 +464,13 @@ if IS_ADMIN:
                 k1, k2 = st.columns(2)
                 if k1.button("✅ סמן כהושלם לחלוטין", key="btn_done"):
                     db().table("projects").update({"status": "הושלם", "completed_at": pd.Timestamp.now(tz="UTC").isoformat()}).eq("id", sid).execute()
-                    st.rerun()
+                    rerun()
                 if k2.button("❄️ הקפא פרויקט", key="btn_freeze"):
                     if not fr.strip():
                         st.error("חובה לכתוב סיבת הקפאה.")
                     else:
                         db().table("projects").update({"status": "בהשהייה", "freeze_reason": fr.strip(), "frozen_at": pd.Timestamp.now(tz="UTC").isoformat()}).eq("id", sid).execute()
-                        st.rerun()
+                        rerun()
             st.divider()
             st.subheader("עריכת פרויקט")
             sel = st.selectbox("בחר פרויקט", projs["label"], key="editsel")
@@ -396,7 +486,7 @@ if IS_ADMIN:
                 st.link_button("📂 פתיחת תיקיית הפרויקט", new_dr)
             if st.button("עדכון פרויקט"):
                 db().table("projects").update({"budget": new_b, "status": new_s, "est_hours": new_est, "ptype": new_pt, "drive_url": new_dr}).eq("id", int(row["id"])).execute()
-                st.rerun()
+                rerun()
 
     # ---------------- דשבורד ----------------
     with t_dash:
@@ -472,7 +562,7 @@ if IS_ADMIN:
                     if amt > 0:
                         db().table("payments").insert({"project_id": int(projs.loc[projs["label"] == pp, "id"].iloc[0]),
                                                        "pay_date": str(pdate), "amount": amt, "note": note}).execute()
-                        st.rerun()
+                        rerun()
                     else:
                         st.error("יש להזין סכום גדול מ-0.")
             paid = pays.groupby("project_id")["amount"].sum().astype(float).rename("paid") if not pays.empty else pd.Series(dtype=float, name="paid")
@@ -493,7 +583,7 @@ if IS_ADMIN:
                     did = st.selectbox("מס' תשלום למחיקה", hp["id"])
                     if st.button("מחק תשלום"):
                         db().table("payments").delete().eq("id", int(did)).execute()
-                        st.rerun()
+                        rerun()
 
     with t_set:
         st.subheader("עלות שכר לשעה")
@@ -528,7 +618,7 @@ with t_task:
                         "week_start": str(CUR_WS + dt.timedelta(days=7 if when == "שבוע הבא" else 0)),
                         "due_date": str(tdue) if tdue else None,
                         "employee_id": None if who == "כולם" else int(emps.loc[emps["name"] == who, "id"].iloc[0])}).execute()
-                    st.rerun()
+                    rerun()
                 else:
                     st.error("יש לכתוב משימה.")
     for gt, g in [("⏰ מהשבועות הקודמים – לטפל קודם", open_t[open_t["ws"] < CUR_WS]),
@@ -541,7 +631,7 @@ with t_task:
             txt = f"{plab.get(r['project_id'], '')}: {r['title']}" + (f" · {wn.iloc[0]}" if not wn.empty else "") + (f" · עד {str(r['due_date'])[:10]}" if pd.notna(r.get("due_date")) else "")
             if st.checkbox(txt, key=f"tk{r['id']}"):
                 db().table("tasks").update({"done": True}).eq("id", int(r["id"])).execute()
-                st.rerun()
+                rerun()
     if open_t.empty:
         st.success("אין משימות פתוחות 🎉")
 
@@ -560,7 +650,7 @@ if IS_ADMIN:
                 if st.form_submit_button("➕ הוספה", type="primary") and mn.strip():
                     db().table("milestones").insert({"project_id": int(projs.loc[projs["label"] == mp, "id"].iloc[0]),
                                                      "name": mn.strip(), "due_date": str(md), "amount": ma}).execute()
-                    st.rerun()
+                    rerun()
             if not mstones.empty:
                 m = mstones.merge(projs[["id", "label"]].rename(columns={"id": "project_id"}), on="project_id")
                 m["מצב"] = m.apply(lambda r: "שולם ✅" if r["done"] else ("באיחור ⚠️" if pd.to_datetime(r["due_date"]).date() < TODAY else "ממתין"), axis=1)
@@ -571,10 +661,10 @@ if IS_ADMIN:
                 b1, b2 = st.columns(2)
                 if b1.button("סמן כבוצע/שולם"):
                     db().table("milestones").update({"done": True}).eq("id", int(mid)).execute()
-                    st.rerun()
+                    rerun()
                 if b2.button("מחק אבן דרך"):
                     db().table("milestones").delete().eq("id", int(mid)).execute()
-                    st.rerun()
+                    rerun()
             st.divider()
             st.subheader("הוצאות לפרויקט")
             with st.form("exp", clear_on_submit=True):
@@ -587,7 +677,7 @@ if IS_ADMIN:
                     if ea > 0:
                         db().table("expenses").insert({"project_id": int(projs.loc[projs["label"] == ep, "id"].iloc[0]),
                                                        "exp_date": str(ed2), "amount": ea, "note": en}).execute()
-                        st.rerun()
+                        rerun()
                     else:
                         st.error("יש להזין סכום.")
             if not exps.empty:
@@ -596,7 +686,7 @@ if IS_ADMIN:
                 xid = st.selectbox("מס' הוצאה למחיקה", xe["id"])
                 if st.button("מחק הוצאה"):
                     db().table("expenses").delete().eq("id", int(xid)).execute()
-                    st.rerun()
+                    rerun()
 
     # ---- הצעות / לידים ----
     with t_lead:
@@ -608,7 +698,7 @@ if IS_ADMIN:
             lst = c2.selectbox("סטטוס", LEAD_ST)
             if st.form_submit_button("➕ הוספה", type="primary") and lcl.strip():
                 db().table("leads").insert({"client": lcl.strip(), "descr": ldc, "amount": lam, "status": lst}).execute()
-                st.rerun()
+                rerun()
         if not leads.empty:
             leads["amount"] = leads["amount"].astype(float)
             m1, m2 = st.columns(2)
@@ -619,7 +709,7 @@ if IS_ADMIN:
             ns = st.selectbox("סטטוס חדש", LEAD_ST, key="ns")
             if st.button("עדכון סטטוס"):
                 db().table("leads").update({"status": ns}).eq("id", int(lid)).execute()
-                st.rerun()
+                rerun()
 
     # ---- הגדרות: נעילת חודשים וגיבוי ----
     with t_set:
@@ -632,10 +722,10 @@ if IS_ADMIN:
         b1, b2 = st.columns(2)
         if b1.button("🔒 נעל חודש"):
             db().table("month_locks").upsert({"month": lm}).execute()
-            st.rerun()
+            rerun()
         if b2.button("🔓 פתח חודש"):
             db().table("month_locks").delete().eq("month", lm).execute()
-            st.rerun()
+            rerun()
         st.divider()
         st.subheader("💾 גיבוי")
         if st.button("הכנת קובץ גיבוי מלא"):
@@ -668,7 +758,7 @@ if IS_ADMIN:
                         rows = [{"project_id": int(pid), "employee_id": int(oe["id"])} for _, oe in others.iterrows() if ed_g.loc[lab, oe["name"]]]
                         if rows:
                             db().table("project_access").insert(rows).execute()
-                st.rerun()
+                rerun()
         st.divider()
         with st.expander("📥 ייבוא פרויקטים מקובץ Excel / CSV"):
             cols_i = ["לקוח", "שם פרויקט", "תיאור", "סכום", "סטטוס", "הערכת שעות", "סוג", "קישור"]
@@ -702,7 +792,7 @@ if IS_ADMIN:
                                 db().table("project_access").insert(acc_rows).execute()
                         st.session_state.imp_msg = f"יובאו {len(rows)} פרויקטים ✅"
                         st.session_state.upk = st.session_state.get("upk", 0) + 1
-                        st.rerun()
+                        rerun()
 
 if not IS_ADMIN:
     with t_task:
@@ -713,19 +803,22 @@ if not IS_ADMIN:
             st.caption("אין פולואפים פתוחים.")
         for _, r in mf.iterrows():
             txt = f"{r['title']}" + (f" · {r['contact']}" if nz(r["contact"], "") else "") + (f" · עד {str(r['due_date'])[:10]}" if pd.notna(r["due_date"]) else "")
+            if fu_notes_list(r):
+                txt = f"**{txt}** 📝{len(fu_notes_list(r))}"
             if st.checkbox(txt, key=f"efu{r['id']}"):
                 db().table("followups").update({"done": True}).eq("id", int(r["id"])).execute()
-                st.rerun()
-            if nz(r["notes"], ""):
-                st.caption(r["notes"])
+                rerun()
+            fu_notes(r, f"e{r['id']}")
 
 if IS_ADMIN:
+    _paid = pays.assign(amount=pays["amount"].astype(float)).groupby("project_id")["amount"].sum()
+    _hrs = entries.assign(hours=entries["hours"].astype(float)).groupby("project_id")["hours"].sum()
+    _exp = exps.assign(amount=exps["amount"].astype(float)).groupby("project_id")["amount"].sum()
     def psum(pid):
         b = float(projs.loc[projs["id"] == pid, "budget"].iloc[0])
-        pd_ = pays[pays["project_id"] == pid]["amount"].astype(float).sum()
+        pd_ = float(_paid.get(pid, 0.0))
         return {"budget": b, "paid": pd_, "left": b - pd_, "ms": mstones[mstones["project_id"] == pid],
-                "hours": entries[entries["project_id"] == pid]["hours"].astype(float).sum(),
-                "exp": exps[exps["project_id"] == pid]["amount"].astype(float).sum()}
+                "hours": float(_hrs.get(pid, 0.0)), "exp": float(_exp.get(pid, 0.0))}
 
     def ms_tbl(ms):
         return ms[["name", "due_date", "amount", "done"]].rename(columns={"name": "אבן דרך", "due_date": "תאריך יעד", "amount": "סכום (₪)", "done": "בוצע/שולם"})
@@ -751,7 +844,7 @@ if IS_ADMIN:
             dp_ = x1.selectbox("מס' תשלום למחיקה", pp_["id"], key=f"fe_dp_{kk}")
             if x2.button("מחק", key=f"fe_dpb_{kk}"):
                 db().table("payments").delete().eq("id", int(dp_)).execute()
-                st.rerun()
+                rerun()
         with st.form(f"fe_fp_{kk}", clear_on_submit=True):
             x1, x2 = st.columns(2)
             a_ = x1.number_input("סכום ששולם (₪)", 0.0, step=500.0, key=f"fe_pa_{kk}")
@@ -760,7 +853,7 @@ if IS_ADMIN:
             if st.form_submit_button("➕ רישום תשלום", type="primary"):
                 if a_ > 0:
                     db().table("payments").insert({"project_id": pid, "pay_date": str(d_), "amount": a_, "note": n_}).execute()
-                    st.rerun()
+                    rerun()
                 else:
                     st.error("יש להזין סכום גדול מ-0.")
         st.markdown("**🚩 אבני דרך**")
@@ -773,13 +866,13 @@ if IS_ADMIN:
             y1, y2, y3 = st.columns(3)
             if y1.button("סמן כבוצע", key=f"fe_md_{kk}"):
                 db().table("milestones").update({"done": True}).eq("id", int(mi_)).execute()
-                st.rerun()
+                rerun()
             if y2.button("בטל סימון", key=f"fe_mu_{kk}"):
                 db().table("milestones").update({"done": False}).eq("id", int(mi_)).execute()
-                st.rerun()
+                rerun()
             if y3.button("מחק", key=f"fe_ml_{kk}"):
                 db().table("milestones").delete().eq("id", int(mi_)).execute()
-                st.rerun()
+                rerun()
         with st.form(f"fe_fm_{kk}", clear_on_submit=True):
             z1, z2, z3 = st.columns(3)
             mn_ = z1.text_input("שם אבן דרך", key=f"fe_mn_{kk}")
@@ -787,7 +880,7 @@ if IS_ADMIN:
             ma_ = z3.number_input("סכום (₪)", 0.0, step=500.0, key=f"fe_ma_{kk}")
             if st.form_submit_button("➕ הוספת אבן דרך") and mn_.strip():
                 db().table("milestones").insert({"project_id": pid, "name": mn_.strip(), "due_date": str(md_), "amount": ma_}).execute()
-                st.rerun()
+                rerun()
 
     # ---- פרויקטים שהושלמו ----
     with t_done:
@@ -802,10 +895,11 @@ if IS_ADMIN:
             m2.metric("שולם", f"₪{ov['שולם (₪)'].sum():,.0f}")
             m3.metric("נותר לגבות", f"₪{ov['נותר לגבות (₪)'].sum():,.0f}")
             st.dataframe(ov, hide_index=True, use_container_width=True, column_config=PCT)
-            for _, p in dn.iterrows():
+            sel_d = st.selectbox("פתיחת פרויקט לפירוט ועריכה", dn["label"], key="dnsel")
+            for _, p in dn[dn["label"] == sel_d].iterrows():
                 s_ = psum(int(p["id"]))
                 pct_ = (s_["paid"] / s_["budget"] * 100) if s_["budget"] else 0
-                with st.expander(f"{p['label']} · שולם ₪{s_['paid']:,.0f} מתוך ₪{s_['budget']:,.0f} ({pct_:.0f}%)"):
+                with st.expander(f"{p['label']} · שולם ₪{s_['paid']:,.0f} מתוך ₪{s_['budget']:,.0f} ({pct_:.0f}%)", expanded=True):
                     st.progress(min(pct_ / 100, 1.0))
                     if s_["left"] > 0:
                         st.warning(f"נותר לגבות ₪{s_['left']:,.0f}")
@@ -813,7 +907,7 @@ if IS_ADMIN:
                     fin_editor(int(p["id"]), f"d{p['id']}")
                     if st.button("↩ החזר לעבודה", key=f"reo{p['id']}"):
                         db().table("projects").update({"status": "פעיל", "completed_at": None}).eq("id", int(p["id"])).execute()
-                        st.rerun()
+                        rerun()
 
     # ---- פרויקטים מוקפאים ----
     with t_frozen:
@@ -823,10 +917,11 @@ if IS_ADMIN:
             st.info("אין פרויקטים מוקפאים. להקפאה: לשונית פרויקטים ← סטטוס פרויקט (סיבה חובה).")
         else:
             st.dataframe(overview(fz), hide_index=True, use_container_width=True, column_config=PCT)
-            for _, p in fz.iterrows():
+            sel_f = st.selectbox("פתיחת פרויקט לפירוט ועריכה", fz["label"], key="fzsel")
+            for _, p in fz[fz["label"] == sel_f].iterrows():
                 pid_ = int(p["id"])
                 s_ = psum(pid_)
-                with st.expander(f"❄️ {p['label']} · שולם ₪{s_['paid']:,.0f} מתוך ₪{s_['budget']:,.0f}"):
+                with st.expander(f"❄️ {p['label']} · שולם ₪{s_['paid']:,.0f} מתוך ₪{s_['budget']:,.0f}", expanded=True):
                     st.error(f"סיבת ההקפאה: {nz(p.get('freeze_reason'), 'לא צוינה')}")
                     if pd.notna(p.get("frozen_at")):
                         st.caption(f"הוקפא בתאריך {str(p['frozen_at'])[:10]}")
@@ -846,7 +941,7 @@ if IS_ADMIN:
                     fin_editor(pid_, f"z{pid_}")
                     if st.button("🔓 שחרר הקפאה – החזר לעבודה", key=f"unf{pid_}", type="primary"):
                         db().table("projects").update({"status": "פעיל", "freeze_reason": None, "frozen_at": None}).eq("id", pid_).execute()
-                        st.rerun()
+                        rerun()
 
     # ---- פולואפ ושיווק ----
     FU = ["פרויקט לפולואפ", "הצעת מחיר לשליחה", "אדריכל / איש מקצוע לפולואפ", "משימת שיווק", "גבייה"]
@@ -881,7 +976,7 @@ if IS_ADMIN:
                         if f_t.strip():
                             db().table("followups").insert({"category": cat, "title": f_t.strip(), "contact": f_c, "notes": f_n,
                                                             "amount": f_a or None, "due_date": str(f_d), "employee_id": int(emps.loc[emps["name"] == f_w, "id"].iloc[0])}).execute()
-                            st.rerun()
+                            rerun()
                         else:
                             st.error("יש להזין שם / נושא.")
                 cf = fus[fus["category"] == cat]
@@ -891,11 +986,12 @@ if IS_ADMIN:
                 for _, r in op.iterrows():
                     late_f = pd.notna(r["due_date"]) and pd.to_datetime(r["due_date"]) < pd.Timestamp(TODAY)
                     txt = f"{'🔴 ' if late_f else ''}{r['title']}" + (f" · {r['contact']}" if nz(r["contact"], "") else "") + (f" · עד {str(r['due_date'])[:10]}" if pd.notna(r["due_date"]) else "") + (f" · ₪{float(r['amount']):,.0f}" if pd.notna(r["amount"]) else "") + (f" · 👤 {emps.loc[emps['id'] == r['employee_id'], 'name'].iloc[0]}" if pd.notna(r["employee_id"]) and (emps["id"] == r["employee_id"]).any() else "")
+                    if fu_notes_list(r):
+                        txt = f"**{txt}** 📝{len(fu_notes_list(r))}"
                     if st.checkbox(txt, key=f"fu{r['id']}"):
                         db().table("followups").update({"done": True}).eq("id", int(r["id"])).execute()
-                        st.rerun()
-                    if nz(r["notes"], ""):
-                        st.caption(r["notes"])
+                        rerun()
+                    fu_notes(r, f"a{r['id']}")
                 dn_f = cf[cf["done"].astype(bool)]
                 if not dn_f.empty:
                     with st.expander(f"בוצעו ({len(dn_f)})"):
@@ -903,7 +999,7 @@ if IS_ADMIN:
                         fdel = st.selectbox("מס' למחיקה", dn_f["id"], key=f"fdel{cat}")
                         if st.button("מחק", key=f"fdb{cat}"):
                             db().table("followups").delete().eq("id", int(fdel)).execute()
-                            st.rerun()
+                            rerun()
 
 if IS_ADMIN:
     with t_proj:
@@ -922,7 +1018,7 @@ if IS_ADMIN:
             if st.button("🗑 מחיקת הפרויקט לצמיתות", key="delbtn"):
                 if conf.strip() == "מחק":
                     db().table("projects").delete().eq("id", did_).execute()
-                    st.rerun()
+                    rerun()
                 else:
                     st.error("כדי למחוק יש להקליד את המילה: מחק")
 
