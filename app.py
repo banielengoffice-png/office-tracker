@@ -128,7 +128,9 @@ if projs.empty:
 if entries.empty:
     entries = pd.DataFrame(columns=["id", "employee_id", "project_id", "work_date", "hours", "description"])
 
-projs["label"] = projs["client"].astype(str) + " – " + projs["name"].astype(str)
+projs["label"] = [c if c == n else f"{c} – {n}" for c, n in zip(projs["client"].astype(str), projs["name"].astype(str))]
+_dup = projs["label"].duplicated(keep=False)
+projs.loc[_dup, "label"] = projs.loc[_dup, "label"] + " #" + projs.loc[_dup, "id"].astype(str)
 def lc(t, cols):
     d = load(t)
     return d if not d.empty else pd.DataFrame(columns=cols)
@@ -678,6 +680,7 @@ if IS_ADMIN:
             if up:
                 df_i = pd.read_csv(up) if up.name.endswith(".csv") else pd.read_excel(up)
                 st.dataframe(df_i, hide_index=True, use_container_width=True)
+                vis_imp = st.checkbox("הצג את הפרויקטים הפעילים שיובאו גם לעובדת (בלי סכומים)", value=True)
                 if st.button("✅ ייבוא הפרויקטים", type="primary"):
                     rows = []
                     for _, r in df_i.iterrows():
@@ -691,7 +694,12 @@ if IS_ADMIN:
                                      "ptype": r.get("סוג") if r.get("סוג") in PTYPES else None,
                                      "drive_url": str(nz(r.get("קישור"), ""))})
                     if rows:
-                        db().table("projects").insert(rows).execute()
+                        res = db().table("projects").insert(rows).execute()
+                        if vis_imp:
+                            oth = [int(x) for x in emps.loc[emps["name"] != USER["employee"], "id"]]
+                            acc_rows = [{"project_id": p_["id"], "employee_id": o_} for p_ in res.data if p_["status"] == "פעיל" for o_ in oth]
+                            if acc_rows:
+                                db().table("project_access").insert(acc_rows).execute()
                         st.session_state.imp_msg = f"יובאו {len(rows)} פרויקטים ✅"
                         st.session_state.upk = st.session_state.get("upk", 0) + 1
                         st.rerun()
